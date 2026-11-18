@@ -272,7 +272,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: flatpak
-          path: dist/*
+          path: |
+            dist/*.flatpak
+            dist/*.flatpak.sha256
           if-no-files-found: error
 
   # The Windows setup: the runtime laid out as a user's tree, the NSIS
@@ -439,7 +441,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: dist/*
+          # The setup and its digest, not the staging directory `pack.sh`
+          # leaves beside them.
+          path: |
+            dist/*-windows-x86_64.exe
+            dist/*-windows-x86_64.exe.sha256
           if-no-files-found: error
 
   # The release, only when both platforms that were asked for succeeded: a
@@ -526,6 +532,10 @@ jobs:
           set -euo pipefail
           pre=""
           [ "$PRERELEASE" = yes ] && pre="--prerelease"
+          # Files only: an artifact's directory is not an asset, and one
+          # stray entry used to stop the whole release after the builds.
+          mapfile -t assets < <(find dist -maxdepth 1 -type f | sort)
+          [ "${#assets[@]}" -gt 0 ] || { echo "release: nothing in dist" >&2; exit 2; }
           python3 ci/scripts/release.py "$TAG" --title "$TITLE" \
               --notes-file "$RUNNER_TEMP/notes.md" --target "$GITHUB_SHA" \
-              $pre dist/*
+              $pre "${assets[@]}"

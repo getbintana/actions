@@ -46,18 +46,28 @@ fi
 mkdir -p "$out"
 rm -f "$out"/*-windows-x86_64.exe "$out"/*-windows-x86_64.exe.sha256 2>/dev/null || true
 
+# The compile happens in a directory of its own inside `out`, on the same
+# filesystem so the setup is a rename away: `tools/pack.sh --nsis` stages the
+# payload, the `.nsi` and the `.ico` beside it, and those are a build context
+# -- uploading them as release assets is how a directory ends up in `dist`.
+work=$(mktemp -d "$out/.stage.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+
 BINTANA="$runtime/bin/bintana.exe" \
-    "$bintana/tools/pack.sh" --nsis "$project" "$out" \
+    "$bintana/tools/pack.sh" --nsis "$project" "$work" \
     --prefix "$runtime" "${extra[@]}"
 
-setup="$out/$command-$version-windows-x86_64.exe"
+setup="$work/$command-$version-windows-x86_64.exe"
 [[ -f $setup ]] || {
     echo "nsis: pack wrote no $(basename "$setup")" >&2
-    ls -l "$out" >&2
+    ls -l "$work" >&2
     exit 2
 }
 
-( cd "$(dirname "$setup")" && sha256sum "$(basename "$setup")" \
+mv "$setup" "$out/"
+setup="$out/$(basename "$setup")"
+
+( cd "$out" && sha256sum "$(basename "$setup")" \
       > "$(basename "$setup").sha256" )
 
 echo "$setup"

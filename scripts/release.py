@@ -39,7 +39,7 @@ def main():
 
     for path in args.files:
         if not os.path.isfile(path):
-            print(f"release: no {path}", file=sys.stderr)
+            print(f"release: {path} is not a file", file=sys.stderr)
             return 2
 
     title = args.title or args.tag
