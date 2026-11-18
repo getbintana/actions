@@ -73,7 +73,7 @@ and of the runtime the files were built from.
 | `project` | `.` | the project below the repository root |
 | `finish_args` | `""` | Flatpak sandbox permissions, comma separated; **they replace** the default `--share=ipc`, Wayland, fallback X11 and DRI, so an application that opens the user's files names all of them |
 | `with_paths` | `""` | runtime-tree paths the Windows setup carries besides the runtime, one per line (`share/bintana/examples`); a path the tree does not have stops the release |
-| `bintana_ref` | `""` | the `getbintana/bintana` ref; empty is its **newest tag** |
+| `bintana_ref` | `""` | the `getbintana/bintana` ref; empty is its **default branch** |
 | `actions_ref` | `""` | this repository's ref to take the scripts from; empty is the ref the workflow was called at |
 | `tag` | `""` | the tag to publish under; empty is `v<version>`, and a tag that is not `v` and the version is refused |
 | `publish` | `true` | create or refresh the release |
@@ -84,10 +84,11 @@ and of the runtime the files were built from.
 
 Every release compiles the runtime it packages: the Windows setup carries its
 own copy of it, and the Flatpak is built on the BaseApp the runtime version
-names. Empty `bintana_ref` is the runtime's newest tag -- a tagged runtime is
-a known source, and its version is the BaseApp branch the bundle needs; with
-no tag, the default branch. Pin `bintana_ref` in the calling workflow when a
-release has to be reproducible.
+names. Empty `bintana_ref` is the runtime's **default branch** -- the source
+the central repositories and the published BaseApp are built from; a tag can
+be older than a fix the Windows build needs (`v0.4.0-rc2` fails to link
+`bintana-meta`). Pin `bintana_ref` in the calling workflow when a release has
+to be reproducible, choosing a commit that builds on both runners.
 
 The runtime's commit is resolved and recorded in the notes. A branch is
 accepted, and is then whatever that branch was when the job checked it out.

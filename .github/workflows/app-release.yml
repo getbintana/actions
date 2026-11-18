@@ -37,7 +37,7 @@ on:
         type: string
         default: ""
       bintana_ref:
-        description: "getbintana/bintana ref to build the runtime from. Empty is its newest tag -- pin it for a reproducible release"
+        description: "getbintana/bintana ref to build the runtime from. Empty is its default branch -- pin it for a reproducible release"
         type: string
         default: ""
       actions_ref:
@@ -152,15 +152,16 @@ jobs:
 
           cat "$RUNNER_TEMP/plan.json"
 
-      # The runtime a release is built on. Empty means the newest tag: a
-      # tagged runtime is a known source, and its `CMakeLists.txt` version is
-      # the BaseApp branch a Flatpak needs. A repository with no tag falls back
-      # to the default branch, and a caller that pins `bintana_ref` gets that
-      # one, build after build.
+      # The runtime a release is built on. Empty means the runtime's default
+      # branch -- the same source the central flatpak and windows repositories
+      # build from, and the one the published BaseApp tracks. **Not a tag**:
+      # a tag can be older than a fix the Windows build needs (v0.4.0-rc2
+      # predates `bta_throw_text` reaching every target, and fails to link
+      # `bintana-meta`). A caller that pins `bintana_ref` gets that one, build
+      # after build.
       #
-      # The commit is resolved for the notes -- `^{}` peels an annotated tag
-      # to the commit it names, and the plain ref answers a branch or a
-      # lightweight tag.
+      # `--symref` answers the branch and its commit in one query, and `^{}`
+      # peels an annotated tag to the commit it names.
       - name: The runtime
         id: runtime
         env:
@@ -169,16 +170,22 @@ jobs:
           set -euo pipefail
           url=https://github.com/getbintana/bintana.git
 
-          ref=$PINNED
-          if [ -z "$ref" ]; then
-              ref=$(git ls-remote --tags --sort=-v:refname "$url" \
-                    | sed -n 's#.*refs/tags/\(v[0-9][^^]*\)$#\1#p' \
-                    | head -1 || true)
+          if [ -n "$PINNED" ]; then
+              ref=$PINNED
+              # A commit id is not a ref: `ls-remote` would answer nothing, so
+              # the notes take it at its word and the checkout fetches it.
+              commit=
+              if [ "${#ref}" -eq 40 ] && [[ $ref != *[!0-9a-f]* ]]; then
+                  commit=$ref
+              fi
+              [ -n "$commit" ] || commit=$(git ls-remote "$url" "$ref^{}" | cut -f1)
+              [ -n "$commit" ] || commit=$(git ls-remote "$url" "$ref" | cut -f1)
+          else
+              head=$(git ls-remote --symref "$url" HEAD)
+              ref=$(sed -n 's#^ref: refs/heads/\([^[:space:]]*\)[[:space:]]*HEAD$#\1#p' <<<"$head")
+              commit=$(awk '$2 == "HEAD" { print $1 }' <<<"$head")
+              ref=${ref:-main}
           fi
-          ref=${ref:-main}
-
-          commit=$(git ls-remote "$url" "$ref^{}" | cut -f1)
-          [ -n "$commit" ] || commit=$(git ls-remote "$url" "$ref" | cut -f1)
 
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
           echo "commit=$commit" >> "$GITHUB_OUTPUT"

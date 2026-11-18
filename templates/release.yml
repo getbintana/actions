@@ -41,4 +41,4 @@ jobs:
       # finish_args: "--share=ipc,--socket=wayland,--socket=fallback-x11,--device=dri,--filesystem=home"
       # with_paths: |           # runtime paths the Windows setup carries
       #   share/bintana/examples
-      # bintana_ref: v0.4.0     # the runtime; empty is its newest tag
+      # bintana_ref: v0.4.0     # the runtime; empty is its default branch
