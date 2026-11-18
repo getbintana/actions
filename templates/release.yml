@@ -1,0 +1,44 @@
+# The release of a Bintana application: a Flatpak bundle and a Windows setup,
+# attached to the tag's release in this repository.
+#
+# Copy this file to `.github/workflows/release.yml`, and the application's
+# repository is done -- everything else is getbintana/actions, and its README
+# has the inputs and what is published.
+#
+#   git tag v0.1 && git push origin v0.1
+#
+# publishes; *Actions -> release -> Run workflow* with the box unticked only
+# builds, and leaves the two files as artifacts of the run.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the release"
+        type: boolean
+        default: false
+
+# `contents: write` for the tag and the release; `actions: read` for the
+# artifacts the release job gathers.
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  release:
+    uses: getbintana/actions/.github/workflows/app-release.yml@main
+    with:
+      # A tag push publishes; a manual run only when the box says so.
+      publish: ${{ github.ref_type == 'tag' || inputs.publish }}
+
+      # Most applications need nothing below. Every one of these follows the
+      # project, not the workflow.
+      #
+      # project: "."             # a project.btp below the repository root
+      # finish_args: "--share=ipc,--socket=wayland,--socket=fallback-x11,--device=dri,--filesystem=home"
+      # with_paths: |           # runtime paths the Windows setup carries
+      #   share/bintana/examples
+      # bintana_ref: v0.4.0     # the runtime; empty is its newest tag

@@ -1,0 +1,524 @@
+# The release of one Bintana application: a Flatpak bundle and a Windows
+# setup, attached to a release in the application's own repository.
+#
+# **This is a reusable workflow** (`on: workflow_call`), not a repository of
+# its own to grow a registry in: the application's repository calls it from a
+# file of its own, `templates/release.yml` in this repository is that file, and
+# everything it needs -- the project, its metainfo, its icon -- is already in
+# the application's repository. Nothing here names an application.
+#
+# What is built is what `tools/pack.sh` builds, twice: the Flatpak manifest
+# and bundle on Linux, and the NSIS setup on Windows, from a runtime compiled
+# at the ref asked for. Before anything is published each product is installed
+# and run -- the same smoke the central `getbintana/flatpak` and
+# `getbintana/windows` repositories run -- so a bundle or a setup that installs
+# a program that does not start is not released.
+#
+# The release is the tag's, in the calling repository: `<app>-<version>` is in
+# the notes and the assets are `<command>-<version>-linux-x86_64.flatpak` and
+# `<command>-<version>-windows-x86_64.exe`, each with a `.sha256` beside it. A
+# rebuild under the same tag replaces the assets in place, because it is the
+# same release, rebuilt.
+name: bintana app release
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: "The Bintana project inside the calling repository (a project.btp)"
+        type: string
+        default: "."
+      finish_args:
+        description: "Flatpak sandbox permissions, comma separated. They replace the default four."
+        type: string
+        default: ""
+      with_paths:
+        description: "Runtime-tree paths the Windows setup carries besides the runtime, one per line"
+        type: string
+        default: ""
+      bintana_ref:
+        description: "getbintana/bintana ref to build the runtime from. Empty is its newest tag -- pin it for a reproducible release"
+        type: string
+        default: ""
+      actions_ref:
+        description: "This repository's ref to take the scripts from. Empty is the commit this workflow was called at"
+        type: string
+        default: ""
+      tag:
+        description: "The tag to publish under. Empty is v<version>"
+        type: string
+        default: ""
+      publish:
+        description: "Create or refresh the GitHub release"
+        type: boolean
+        default: true
+      flatpak:
+        description: "Build the Flatpak bundle"
+        type: boolean
+        default: true
+      windows:
+        description: "Build the Windows setup"
+        type: boolean
+        default: true
+    outputs:
+      id:
+        description: "The application id"
+        value: ${{ jobs.plan.outputs.id }}
+      version:
+        description: "The project's version"
+        value: ${{ jobs.plan.outputs.version }}
+      tag:
+        description: "The tag the release was published under"
+        value: ${{ jobs.plan.outputs.tag }}
+      flatpak:
+        description: "The Flatpak asset's file name, empty when not built"
+        value: ${{ jobs.flatpak.outputs.asset }}
+      windows:
+        description: "The Windows asset's file name, empty when not built"
+        value: ${{ jobs.windows.outputs.asset }}
+
+# A release writes a tag and a release in the calling repository, and the
+# release job reads the artifacts the other jobs uploaded. The caller cannot
+# widen this, so a caller that grants less fails here, by design.
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  # The identity, the version and the tag, and the early refusals -- an id, a
+  # metainfo that disagrees with it and an icon are checked in seconds instead
+  # of after a runtime has been compiled on two runners. `tools/pack.sh` is
+  # still the authority and repeats them.
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      id: ${{ steps.plan.outputs.id }}
+      name: ${{ steps.plan.outputs.name }}
+      command: ${{ steps.plan.outputs.command }}
+      version: ${{ steps.plan.outputs.version }}
+      file_version: ${{ steps.plan.outputs.file_version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+      bintana_ref: ${{ steps.runtime.outputs.ref }}
+      runtime_commit: ${{ steps.runtime.outputs.commit }}
+      actions_ref: ${{ inputs.actions_ref || steps.tooling.outputs.ref }}
+
+    steps:
+      - name: The project
+        uses: actions/checkout@v4
+        with:
+          path: app
+          fetch-depth: 1
+
+      # `job.workflow_ref` is this file's own ref inside the called workflow
+      # -- `getbintana/actions/.github/workflows/app-release.yml@<ref>` -- and
+      # `job.workflow_sha` its commit, so `@main` and `@v1` both take the
+      # scripts from where the workflow itself came from. The commit is
+      # preferred: it is the file that is running, even if the ref moves.
+      - name: This workflow's commit
+        id: tooling
+        env:
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          JOB_WORKFLOW_REF: ${{ job.workflow_ref }}
+        run: |
+          ref=${JOB_WORKFLOW_SHA:-}
+          [ -n "$ref" ] || ref=${JOB_WORKFLOW_REF#*@}
+          echo "ref=${ref:-main}" >> "$GITHUB_OUTPUT"
+
+      - name: The tooling
+        uses: actions/checkout@v4
+        with:
+          repository: getbintana/actions
+          ref: ${{ inputs.actions_ref || steps.tooling.outputs.ref }}
+          path: ci
+
+      - name: What this release is
+        id: plan
+        env:
+          PROJECT: ${{ inputs.project }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 ci/scripts/plan.py "app/$PROJECT" --ref "$GITHUB_REF" \
+              ${TAG:+--tag "$TAG"} > "$RUNNER_TEMP/plan.json"
+
+          python3 - "$RUNNER_TEMP/plan.json" <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, sys
+          plan = json.load(open(sys.argv[1]))
+          for key in ("id", "name", "command", "version", "file_version", "tag"):
+              print(f"{key}={plan[key]}")
+          print("prerelease=" + ("yes" if plan["prerelease"] else "no"))
+          EOF
+
+          cat "$RUNNER_TEMP/plan.json"
+
+      # The runtime a release is built on. Empty means the newest tag: a
+      # tagged runtime is a known source, and its `CMakeLists.txt` version is
+      # the BaseApp branch a Flatpak needs. A repository with no tag falls back
+      # to the default branch, and a caller that pins `bintana_ref` gets that
+      # one, build after build.
+      #
+      # The commit is resolved for the notes -- `^{}` peels an annotated tag
+      # to the commit it names, and the plain ref answers a branch or a
+      # lightweight tag.
+      - name: The runtime
+        id: runtime
+        env:
+          PINNED: ${{ inputs.bintana_ref }}
+        run: |
+          set -euo pipefail
+          url=https://github.com/getbintana/bintana.git
+
+          ref=$PINNED
+          if [ -z "$ref" ]; then
+              ref=$(git ls-remote --tags --sort=-v:refname "$url" \
+                    | sed -n 's#.*refs/tags/\(v[0-9][^^]*\)$#\1#p' \
+                    | head -1 || true)
+          fi
+          ref=${ref:-main}
+
+          commit=$(git ls-remote "$url" "$ref^{}" | cut -f1)
+          [ -n "$commit" ] || commit=$(git ls-remote "$url" "$ref" | cut -f1)
+
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "runtime: $ref at ${commit:-unknown}"
+
+  # The Flatpak: the manifest `tools/pack.sh` writes, built on the BaseApp the
+  # published Bintana repository serves, exported as one bundle. The bundle
+  # carries the application and not the runtime, so the release notes say to
+  # add that repository before installing it.
+  flatpak:
+    needs: plan
+    if: inputs.flatpak
+    runs-on: ubuntu-24.04
+    outputs:
+      asset: ${{ steps.build.outputs.asset }}
+
+    steps:
+      - name: The project
+        uses: actions/checkout@v4
+        with:
+          path: app
+
+      - name: The runtime
+        uses: actions/checkout@v4
+        with:
+          repository: getbintana/bintana
+          ref: ${{ needs.plan.outputs.bintana_ref }}
+          path: sources/bintana
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: The tooling
+        uses: actions/checkout@v4
+        with:
+          repository: getbintana/actions
+          ref: ${{ needs.plan.outputs.actions_ref }}
+          path: ci
+
+      # Three host-side tools nothing declares, and every failure lands after
+      # minutes of compiling:
+      # - `elfutils`: flatpak-builder's `eu-strip`, which Ubuntu only
+      #   Recommends;
+      # - `ostree`: what the export and the repository are made with;
+      # - `librsvg2-common`: the host's gdk-pixbuf SVG loader, which
+      #   `appstreamcli compose` rasterizes a scalable icon through, and the
+      #   image ships without it.
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              build-essential cmake pkg-config \
+              flatpak flatpak-builder appstream elfutils ostree librsvg2-common \
+              libgtk-4-dev libgtksourceview-5-dev
+
+      - name: The runtime
+        run: |
+          cmake -S sources/bintana -B sources/bintana/build \
+                -DCMAKE_BUILD_TYPE=Release >/dev/null
+          cmake --build sources/bintana/build -j"$(nproc)"
+
+      - name: The bundle
+        id: build
+        env:
+          PROJECT: ${{ inputs.project }}
+          ID: ${{ needs.plan.outputs.id }}
+          COMMAND: ${{ needs.plan.outputs.command }}
+          FILE_VERSION: ${{ needs.plan.outputs.file_version }}
+          FINISH_ARGS: ${{ inputs.finish_args }}
+        run: |
+          set -euo pipefail
+          asset="$COMMAND-$FILE_VERSION-linux-x86_64.flatpak"
+          mkdir -p dist
+          ci/scripts/flatpak.sh "app/$PROJECT" "dist/$asset" sources/bintana "$ID" \
+              ${FINISH_ARGS:+--finish-args "$FINISH_ARGS"}
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke
+        env:
+          ID: ${{ needs.plan.outputs.id }}
+          COMMAND: ${{ needs.plan.outputs.command }}
+        run: ci/scripts/smoke-linux.sh "$ID" "$COMMAND" ci/smoke/console
+
+      - name: The artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flatpak
+          path: dist/*
+          if-no-files-found: error
+
+  # The Windows setup: the runtime laid out as a user's tree, the NSIS
+  # compiler, and `tools/pack.sh --nsis` per application. The smoke installs
+  # the setup silently and runs what it installed, before anything is
+  # published.
+  windows:
+    needs: plan
+    if: inputs.windows
+    runs-on: windows-latest
+    outputs:
+      asset: ${{ steps.build.outputs.asset }}
+
+    steps:
+      - name: The project
+        uses: actions/checkout@v4
+        with:
+          path: app
+
+      - name: The runtime
+        uses: actions/checkout@v4
+        with:
+          repository: getbintana/bintana
+          ref: ${{ needs.plan.outputs.bintana_ref }}
+          path: sources/bintana
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: The tooling
+        uses: actions/checkout@v4
+        with:
+          repository: getbintana/actions
+          ref: ${{ needs.plan.outputs.actions_ref }}
+          path: ci
+
+      # The MSYS2 steps have no python and the input is multiline: the file is
+      # written here, in Git Bash, and read there.
+      - name: What the setup carries
+        shell: bash
+        env:
+          WITH_PATHS: ${{ inputs.with_paths }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$WITH_PATHS" | sed '/^[[:space:]]*$/d' > with.txt
+          cat with.txt
+
+      # The same packages the central windows repository compiles every setup
+      # against: their DLLs, their data and their licence texts are the
+      # payload's. A package added here is a package every setup carries.
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-vulkan-loader
+            mingw-w64-ucrt-x86_64-gtksourceview5
+            mingw-w64-ucrt-x86_64-sqlite3
+            mingw-w64-ucrt-x86_64-libsoup3
+            mingw-w64-ucrt-x86_64-libxml2
+            mingw-w64-ucrt-x86_64-gstreamer
+            mingw-w64-ucrt-x86_64-gst-plugins-base
+            mingw-w64-ucrt-x86_64-gst-plugins-good
+            mingw-w64-ucrt-x86_64-gst-plugins-bad
+            mingw-w64-ucrt-x86_64-gst-libav
+            mingw-w64-ucrt-x86_64-gst-plugins-rs
+            mingw-w64-ucrt-x86_64-poppler
+            mingw-w64-ucrt-x86_64-libvterm
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-make
+            git
+            gettext
+            openssh
+            ca-certificates
+            make
+            patch
+            diffutils
+            autoconf
+            automake
+            libtool
+            bison
+            flex
+            zip
+            unzip
+            rsync
+            wget
+
+      # The runtime as a Windows user gets it: built, then laid out by
+      # `tools/windows-portable.sh` -- the DLLs, the GTK data, the icon themes
+      # -- which is the tree the setup is staged from.
+      - name: The runtime tree
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cd sources/bintana
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build -j"$(nproc)"
+          tools/windows-portable.sh build "$GITHUB_WORKSPACE/stage/runtime"
+
+      # The compiler, inside the tree where `Nsis.makensis` looks first
+      # (`share/bintana/tools/nsis`). A failed download falls back to the
+      # runner's own NSIS, put on the PATH; a tree that ships its own then
+      # refuses the setup by name instead of releasing one without it.
+      - name: The NSIS compiler
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          dest=stage/runtime/share/bintana/tools/nsis
+          work=$(mktemp -d)
+          if curl -fsSL -o "$work/nsis.zip" \
+                  "https://sourceforge.net/projects/nsis/files/NSIS%203/3.12/nsis-3.12.zip/download" \
+              && (cd "$work" && cmake -E tar xf nsis.zip); then
+              exe=$(find "$work" -name makensis.exe -not -path "*/Bin/*" | head -1)
+              base=$(dirname "$exe")
+              mkdir -p "$dest"
+              for f in makensis.exe COPYING Bin Include Stubs Plugins Contrib; do
+                  [ -e "$base/$f" ] && mv "$base/$f" "$dest/"
+              done
+          fi
+          if [ -f "$dest/Bin/makensis.exe" ] && [ -f "$dest/Contrib/Modern UI 2/MUI2.nsh" ]; then
+              echo "nsis: the bundle, $(find "$dest" -type f | wc -l) files"
+          else
+              rm -rf "$dest"
+              echo "/c/Program Files (x86)/NSIS" >> "$GITHUB_PATH"
+              echo "nsis: no bundle -- the runner's own" >&2
+          fi
+
+      - name: The setup
+        id: build
+        shell: msys2 {0}
+        env:
+          PROJECT: ${{ inputs.project }}
+          COMMAND: ${{ needs.plan.outputs.command }}
+          FILE_VERSION: ${{ needs.plan.outputs.file_version }}
+        run: |
+          set -euo pipefail
+          export PATH="$PATH:/c/Program Files (x86)/NSIS"
+          root=$PWD
+          asset="$COMMAND-$FILE_VERSION-windows-x86_64.exe"
+          mkdir -p dist
+          # Absolute paths: `pack.sh` changes to the runtime's checkout first.
+          ci/scripts/nsis.sh "$root/app/$PROJECT" "$root/dist" \
+              "$root/stage/runtime" "$root/sources/bintana" \
+              "$COMMAND" "$FILE_VERSION" "$root/with.txt"
+          test -f "dist/$asset"
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke
+        shell: msys2 {0}
+        env:
+          COMMAND: ${{ needs.plan.outputs.command }}
+          FILE_VERSION: ${{ needs.plan.outputs.file_version }}
+        run: |
+          ci/scripts/smoke-windows.sh \
+              "dist/$COMMAND-$FILE_VERSION-windows-x86_64.exe" \
+              "$COMMAND" "$PWD/with.txt" \
+              ci/smoke/console ci/smoke/probe
+
+      - name: The artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+          if-no-files-found: error
+
+  # The release, only when both platforms that were asked for succeeded: a
+  # setup that installs a program that does not start is not published, and
+  # neither is half a release. `needs.<job>.result` tells a skipped platform
+  # from a failed one, so `flatpak: false` still publishes the Windows setup.
+  release:
+    needs: [plan, flatpak, windows]
+    if: >-
+      always() && inputs.publish && needs.plan.result == 'success'
+      && (needs.flatpak.result == 'success' || needs.windows.result == 'success')
+      && !cancelled() && !failure()
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: The tooling
+        uses: actions/checkout@v4
+        with:
+          repository: getbintana/actions
+          ref: ${{ needs.plan.outputs.actions_ref }}
+          path: ci
+
+      - name: The assets
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: The notes
+        env:
+          OUT: ${{ runner.temp }}/notes.md
+          NAME: ${{ needs.plan.outputs.name }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          ID: ${{ needs.plan.outputs.id }}
+          REPO: ${{ github.repository }}
+          APP_COMMIT: ${{ github.sha }}
+          RUNTIME_REF: ${{ needs.plan.outputs.bintana_ref }}
+          RUNTIME_COMMIT: ${{ needs.plan.outputs.runtime_commit }}
+          FLATPAK: ${{ needs.flatpak.result == 'success' && 'yes' || 'no' }}
+          WINDOWS: ${{ needs.windows.result == 'success' && 'yes' || 'no' }}
+          FLATPAK_ASSET: ${{ needs.flatpak.outputs.asset }}
+          WINDOWS_ASSET: ${{ needs.windows.outputs.asset }}
+        run: |
+          python3 - <<'PY'
+          import os
+          e = os.environ
+          lines = [f"{e['NAME']} {e['VERSION']}.", ""]
+          lines.append(
+              f"Built from `{e['REPO']}` at `{e['APP_COMMIT']}` on the runtime "
+              f"getbintana/bintana `{e['RUNTIME_REF']}`"
+              + (f" at `{e['RUNTIME_COMMIT']}`" if e["RUNTIME_COMMIT"] else "")
+              + ".")
+          if e["FLATPAK"] == "yes":
+              lines += [
+                  "", "### Linux (Flatpak)", "",
+                  "The bundle carries the application; the BaseApp it runs on "
+                  "comes from the Bintana repository:", "",
+                  "```sh",
+                  "flatpak remote-add --if-not-exists bintana "
+                  "https://getbintana.github.io/flatpak/",
+                  f"flatpak install ./{e['FLATPAK_ASSET']}",
+                  "```",
+              ]
+          if e["WINDOWS"] == "yes":
+              lines += [
+                  "", "### Windows", "",
+                  f"`{e['WINDOWS_ASSET']}` installs for the current user; no "
+                  "administrator needed.",
+              ]
+          lines += ["", "Each file has a `.sha256` beside it."]
+          open(e["OUT"], "w").write("\n".join(lines) + "\n")
+          print("\n".join(lines))
+          PY
+
+      - name: The release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          TITLE: ${{ needs.plan.outputs.name }} ${{ needs.plan.outputs.version }}
+          PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          pre=""
+          [ "$PRERELEASE" = yes ] && pre="--prerelease"
+          python3 ci/scripts/release.py "$TAG" --title "$TITLE" \
+              --notes-file "$RUNNER_TEMP/notes.md" --target "$GITHUB_SHA" \
+              $pre dist/*

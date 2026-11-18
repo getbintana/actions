@@ -1,0 +1,32 @@
+# The workflow is the product: actionlint it, shellcheck the scripts it runs,
+# and run the planner's tests. Nothing here builds a package -- that needs the
+# runtime, MSYS2 and forty minutes, and the release itself is the test.
+name: lint
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: actionlint
+        run: |
+          bash <(curl -fsSL \
+              https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          # actionlint's static `job` context predates `workflow_ref` and
+          # `workflow_sha` (GitHub.com only, documented under the `job`
+          # context). Ignoring just those two properties keeps the rest strict.
+          ./actionlint -color \
+              -ignore 'property "workflow_(ref|sha)" is not defined' \
+              .github/workflows/app-release.yml templates/release.yml
+
+      - name: shellcheck
+        run: shellcheck scripts/*.sh tests/*.sh
+
+      - name: The planner
+        run: tests/plan.sh
